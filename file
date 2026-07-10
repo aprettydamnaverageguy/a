@@ -1,0 +1,367 @@
+local Players = game:GetService("Players")
+local UserInputService = game:GetService("UserInputService")
+local RunService = game:GetService("RunService")
+ 
+local player = Players.LocalPlayer
+local playerGui = player:WaitForChild("PlayerGui")
+ 
+-- ============ MODES ============
+local MODE = {
+	IDLE = "Idle",
+	RECORDING = "Recording",
+	TESTING = "Testing",
+}
+ 
+-- ============ STATE ============
+local currentMode = MODE.IDLE
+local isPaused = false
+ 
+local startPose = nil        -- {cframe, health} captured the instant Recording begins ("frame 0")
+local recordedFrames = {}    -- {cframe, health}[], index 1..N, one entry per Heartbeat while recording
+local currentFrame = 0       -- 0 = startPose, 1..N = recordedFrames[currentFrame]
+ 
+local originalWalkSpeed, originalJumpPower
+ 
+local holdingR = false
+local holdingT = false
+local STEP_INTERVAL = 0.05   -- seconds between steps while holding R/T
+local stepAccumulator = 0
+ 
+local healthChangedConn = nil -- reconnected per-character in onCharacterAdded
+ 
+-- UI refs, filled in by buildUI()
+local pauseLabel, modeLabel, frameLabel
+ 
+-- forward-declare so functions can call each other regardless of definition order
+local getCharacterParts, refreshLock, applyCurrentFrame, getFrameData
+local setPaused, setMode, stepFrame, updateUI, buildUI, onCharacterAdded
+ 
+-- ============ HELPERS ============
+ 
+function getCharacterParts()
+	local character = player.Character or player.CharacterAdded:Wait()
+	local humanoid = character:WaitForChild("Humanoid")
+	local hrp = character:WaitForChild("HumanoidRootPart")
+	return character, humanoid, hrp
+end
+ 
+-- returns the {cframe, health} snapshot for a given frame index (0 = startPose)
+function getFrameData(idx)
+	if idx <= 0 then
+		return startPose
+	end
+	return recordedFrames[idx]
+end
+ 
+-- Locks the character in place whenever we're paused OR actively displaying
+-- a replay frame (you shouldn't be able to walk the character off of a
+-- frame we just teleported it to).
+function refreshLock()
+	local _, humanoid, hrp = getCharacterParts()
+	local shouldLock = isPaused or currentMode == MODE.TESTING
+ 
+	if shouldLock then
+		if originalWalkSpeed == nil then
+			originalWalkSpeed = humanoid.WalkSpeed
+			originalJumpPower = humanoid.JumpPower
+		end
+		humanoid.WalkSpeed = 0
+		humanoid.JumpPower = 0
+		hrp.Anchored = true
+	else
+		humanoid.WalkSpeed = originalWalkSpeed or 16
+		humanoid.JumpPower = originalJumpPower or 50
+		hrp.Anchored = false
+		originalWalkSpeed = nil
+		originalJumpPower = nil
+	end
+end
+ 
+function applyCurrentFrame()
+	local _, humanoid, hrp = getCharacterParts()
+	local frame = getFrameData(currentFrame)
+	if frame then
+		hrp.CFrame = frame.cframe
+		if frame.health then
+			humanoid.Health = frame.health
+		end
+	end
+end
+ 
+function setPaused(state)
+	local wasPaused = isPaused
+	isPaused = state
+ 
+	-- Resuming recording after having rewound: cut everything after
+	-- currentFrame so new capture overwrites the old future instead of
+	-- appending after it.
+	if wasPaused and not isPaused and currentMode == MODE.RECORDING then
+		if currentFrame < #recordedFrames then
+			for i = #recordedFrames, currentFrame + 1, -1 do
+				recordedFrames[i] = nil
+			end
+		end
+	end
+ 
+	refreshLock()
+	updateUI()
+end
+ 
+function setMode(newMode)
+	if newMode == MODE.RECORDING and currentMode ~= MODE.RECORDING then
+		-- fresh recording session only when *entering* recording from elsewhere;
+		-- re-pressing 2 while already recording should NOT wipe your rewind edits
+		local _, humanoid, hrp = getCharacterParts()
+		startPose = { cframe = hrp.CFrame, health = humanoid.Health }
+		recordedFrames = {}
+		currentFrame = 0
+ 
+	elseif newMode == MODE.TESTING then
+		if not startPose or #recordedFrames == 0 then
+			warn("[TAS Tool] Nothing recorded yet — switch to Recording (2) first.")
+			return
+		end
+		currentFrame = 0
+		applyCurrentFrame()
+	end
+ 
+	currentMode = newMode
+	refreshLock()
+	updateUI()
+end
+ 
+function stepFrame(delta)
+	local canStep = currentMode == MODE.TESTING
+		or (currentMode == MODE.RECORDING and isPaused)
+	if not canStep then return end
+ 
+	local newFrame = math.clamp(currentFrame + delta, 0, #recordedFrames)
+	if newFrame ~= currentFrame then
+		currentFrame = newFrame
+		applyCurrentFrame()
+		updateUI()
+	end
+end
+ 
+-- ============ RESPAWN + DEATH-RESCUE HANDLING ============
+ 
+function onCharacterAdded(character)
+	local humanoid = character:WaitForChild("Humanoid")
+	local hrp = character:WaitForChild("HumanoidRootPart")
+ 
+	-- don't let a death actually break the character apart — we're catching
+	-- the health drop before it matters, this is just a backup
+	humanoid.BreakJointsOnDeath = false
+ 
+	-- old cached defaults belonged to the previous character's Humanoid; drop them
+	-- so refreshLock captures fresh defaults off the new one
+	originalWalkSpeed = nil
+	originalJumpPower = nil
+ 
+	if currentMode ~= MODE.IDLE then
+		-- dying mid-recording/testing is a real discontinuity; hand control back
+		-- rather than silently keep going (this only fires if death-rescue below
+		-- somehow didn't catch it in time)
+		isPaused = true
+	end
+ 
+	refreshLock()
+ 
+	if currentMode == MODE.TESTING then
+		applyCurrentFrame()
+	end
+ 
+	updateUI()
+ 
+	-- (re)connect death rescue for this specific Humanoid instance
+	if healthChangedConn then
+		healthChangedConn:Disconnect()
+	end
+ 
+	healthChangedConn = humanoid.HealthChanged:Connect(function(newHealth)
+		if newHealth > 0 then return end
+ 
+		if currentMode == MODE.RECORDING or currentMode == MODE.TESTING then
+			local frame = getFrameData(currentFrame)
+			local rescueHealth = frame and frame.health
+			local rescueCFrame = frame and frame.cframe
+ 
+			if not rescueHealth or rescueHealth <= 0 then
+				rescueHealth = humanoid.MaxHealth
+			end
+ 
+			humanoid.Health = rescueHealth
+			if rescueCFrame then
+				hrp.CFrame = rescueCFrame
+			end
+ 
+			isPaused = true
+			refreshLock()
+			updateUI()
+			print("[TAS Tool] Caught a death — rescued back to the last safe frame.")
+		else
+			-- Idle mode: no recording context to rewind to, just don't let them die
+			humanoid.Health = humanoid.MaxHealth
+			print("[TAS Tool] Caught a death in Idle mode — healed, nothing to rewind to.")
+		end
+	end)
+ 
+	print("[TAS Tool] Character (re)hooked.")
+end
+ 
+player.CharacterAdded:Connect(onCharacterAdded)
+if player.Character then
+	onCharacterAdded(player.Character)
+end
+ 
+-- ============ UI ============
+ 
+function buildUI()
+	local screenGui = Instance.new("ScreenGui")
+	screenGui.Name = "TAS_HUD"
+	screenGui.ResetOnSpawn = false
+	screenGui.Parent = playerGui
+ 
+	local container = Instance.new("Frame")
+	container.Size = UDim2.new(0, 230, 0, 110)
+	container.Position = UDim2.new(0, 20, 0, 20)
+	container.BackgroundColor3 = Color3.fromRGB(20, 20, 20)
+	container.BackgroundTransparency = 0.15
+	container.BorderSizePixel = 0
+	container.Parent = screenGui
+ 
+	local corner = Instance.new("UICorner")
+	corner.CornerRadius = UDim.new(0, 8)
+	corner.Parent = container
+ 
+	local padding = Instance.new("UIPadding")
+	padding.PaddingLeft = UDim.new(0, 12)
+	padding.PaddingTop = UDim.new(0, 10)
+	padding.Parent = container
+ 
+	local layout = Instance.new("UIListLayout")
+	layout.Padding = UDim.new(0, 4)
+	layout.Parent = container
+ 
+	local function makeLabel()
+		local label = Instance.new("TextLabel")
+		label.Size = UDim2.new(1, -24, 0, 24)
+		label.BackgroundTransparency = 1
+		label.Font = Enum.Font.Code
+		label.TextSize = 16
+		label.TextColor3 = Color3.fromRGB(255, 255, 255)
+		label.TextXAlignment = Enum.TextXAlignment.Left
+		label.Parent = container
+		return label
+	end
+ 
+	pauseLabel = makeLabel()
+	modeLabel = makeLabel()
+	frameLabel = makeLabel()
+end
+ 
+function updateUI()
+	if not pauseLabel then return end
+	pauseLabel.Text = "State: " .. (isPaused and "PAUSED" or "RUNNING")
+	modeLabel.Text = "Mode:  " .. currentMode
+	frameLabel.Text = "Frame: " .. currentFrame .. " / " .. #recordedFrames
+end
+ 
+-- ============ PER-FRAME LOOPS ============
+ 
+-- Capture: runs every Heartbeat, only does anything in Recording mode while unpaused
+RunService.Heartbeat:Connect(function()
+	if currentMode ~= MODE.RECORDING or isPaused then return end
+ 
+	local character = player.Character
+	if not character then return end
+	local humanoid = character:FindFirstChild("Humanoid")
+	local hrp = character:FindFirstChild("HumanoidRootPart")
+	if not humanoid or not hrp then return end
+ 
+	table.insert(recordedFrames, { cframe = hrp.CFrame, health = humanoid.Health })
+	currentFrame = #recordedFrames
+	updateUI()
+end)
+ 
+-- Autoplay: runs every Heartbeat, only does anything in Testing mode while unpaused
+RunService.Heartbeat:Connect(function()
+	if currentMode ~= MODE.TESTING or isPaused then return end
+ 
+	if currentFrame >= #recordedFrames then
+		-- reached the end of the recording, auto-pause instead of idling at the last frame
+		isPaused = true
+		refreshLock()
+		updateUI()
+		return
+	end
+ 
+	currentFrame += 1
+	applyCurrentFrame()
+	updateUI()
+end)
+ 
+-- Continuous scrub: R holds toward frame 0, T holds toward the last recorded frame
+-- Works in Testing mode freely, and in Recording mode while paused.
+RunService.Heartbeat:Connect(function(dt)
+	local scrubAllowed = currentMode == MODE.TESTING
+		or (currentMode == MODE.RECORDING and isPaused)
+ 
+	if not scrubAllowed or not (holdingR or holdingT) then
+		stepAccumulator = 0
+		return
+	end
+ 
+	stepAccumulator += dt
+	if stepAccumulator < STEP_INTERVAL then return end
+	stepAccumulator = 0
+ 
+	if holdingR then
+		stepFrame(-1)
+	elseif holdingT then
+		stepFrame(1)
+	end
+end)
+ 
+-- ============ INPUT ============
+ 
+UserInputService.InputBegan:Connect(function(input, gameProcessed)
+	if gameProcessed then return end
+ 
+	if input.UserInputType == Enum.UserInputType.MouseButton1 then
+		setPaused(not isPaused)
+		return
+	end
+ 
+	local keyCode = input.KeyCode
+	if keyCode == Enum.KeyCode.One then
+		setMode(MODE.IDLE)
+	elseif keyCode == Enum.KeyCode.Two then
+		setMode(MODE.RECORDING)
+	elseif keyCode == Enum.KeyCode.Three then
+		setMode(MODE.TESTING)
+	elseif keyCode == Enum.KeyCode.F then
+		stepFrame(-1)
+	elseif keyCode == Enum.KeyCode.G then
+		stepFrame(1)
+	elseif keyCode == Enum.KeyCode.R then
+		holdingR = true
+	elseif keyCode == Enum.KeyCode.T then
+		holdingT = true
+	end
+end)
+ 
+UserInputService.InputEnded:Connect(function(input, _gameProcessed)
+	local keyCode = input.KeyCode
+	if keyCode == Enum.KeyCode.R then
+		holdingR = false
+	elseif keyCode == Enum.KeyCode.T then
+		holdingT = false
+	end
+end)
+ 
+-- ============ INIT ============
+ 
+buildUI()
+updateUI()
+ 
